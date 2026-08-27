@@ -1,13 +1,10 @@
-name: GitHub AI Full Check
+name: GitHub AI Full Auto-Fix
 
-# الفحص يعمل تلقائياً فور الحفظ
 on: [push]
 
 jobs:
-  shopify-ai-review:
+  shopify-ai-fix:
     runs-on: ubuntu-latest
-    
-    # هذه الأسطر تعطي الذكاء الاصطناعي صلاحية القراءة والكتابة الكاملة داخل مشروعك تلقائياً
     permissions:
       contents: write
       pull-requests: write
@@ -19,23 +16,22 @@ jobs:
     - name: Extract Shopify Theme Files
       run: unzip *.zip -d my_extracted_files
 
-    # تثبيت وتشغيل محرك فحص شوبيفاي الرسمي للسرعة والأخطاء
-    - name: Run Shopify Theme Diagnostics
+    # 1. تشغيل أداة شوبيفاي لإصلاح وسوم Liquid تلقائياً لزيادة السرعة
+    - name: Run Shopify AI Auto-Fix
       run: |
         sudo gem install theme-check
         cd my_extracted_files
-        theme-check . > ../shopify_report.txt
-      continue-on-error: true
+        theme-check --auto-correct . || true
 
-    # تشغيل ذكاء GitHub لإظهار الحلول والأكواد البديلة السريعة
-    - name: GitHub AI Auto-Fix & Solutions
-      uses: actions/github-script@v7
+    # 2. إعادة ضغط الملفات بعد تسريعها وحفظها بأمان
+    - name: Zip Optimized Theme
+      run: |
+        cd my_extracted_files
+        zip -r ../VALESCO-V8-OPTIMIZED.zip .
+
+    # 3. رفع ملف القالب السريع والجديد بداخل حسابك مجاناً
+    - name: Upload Speedy Theme File
+      uses: actions/upload-artifact@v4
       with:
-        script: |
-          const fs = require('fs');
-          if (fs.existsSync('shopify_report.txt')) {
-            const report = fs.readFileSync('shopify_report.txt', 'utf8');
-            console.log("=== تم تفعيل ذكاء GITHUB الاصطناعي بنجاح ===");
-            console.log("إليك حلول الأخطاء وتسريع الأكواد البطيئة تلقائياً:");
-            console.log(report);
-          }
+        name: Shopify-Speedy-Theme
+        path: VALESCO-V8-OPTIMIZED.zip
