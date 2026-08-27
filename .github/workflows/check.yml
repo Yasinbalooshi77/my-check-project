@@ -13,13 +13,21 @@ jobs:
     - name: Extract Shopify Theme Files
       run: unzip *.zip -d my_extracted_files
 
-    # تثبيت أداة شوبيفاي الرسمية لفحص الأخطاء والسرعة
+    # تثبيت أداة شوبيفاي الرسمية للفحص
     - name: Install Shopify Theme Check Tool
       run: |
         sudo gem install theme-check
 
-    # تشغيل الفحص الشامل ليعطيك التقرير
-    - name: Execute Speed & Bug Diagnostics
+    # تشغيل الفحص وحفظ النتيجة داخل ملف نصي مخصص للتحميل
+    - name: Execute Diagnostics and Save Report
       run: |
         cd my_extracted_files
-        theme-check .
+        theme-check . > ../shopify_audit_report.txt
+      continue-on-error: true
+
+    # أمر إجباري لجعل GitHub يرفع الملف بصفحة التشغيل للتحميل
+    - name: Downloadable Report File
+      uses: actions/upload-artifact@v4
+      with:
+        name: Shopify-Comprehensive-Report
+        path: shopify_audit_report.txt
