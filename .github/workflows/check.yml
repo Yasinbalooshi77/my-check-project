@@ -1,0 +1,22 @@
+name: Zip File Checker
+
+on: [push]
+
+jobs:
+  unpack-and-check:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Open Files
+      uses: actions/checkout@v4
+
+    - name: Unzip File
+      run: |
+        echo "جاري فك ضغط الملف..."
+        unzip *.zip -d my_extracted_files
+
+    - name: Show Extracted Files
+      run: |
+        echo "هذه هي الملفات الموجودة داخل الـ ZIP الحين:"
+        cd my_extracted_files
+        ls -la
