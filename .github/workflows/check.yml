@@ -78,3 +78,13 @@ jobs:
       - name: Fail if real Theme Check errors exist
         if: steps.themecheck.outcome == 'failure'
         run: exit 1
+
+
+
+
+              - name: Upload full audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shopify-theme-check-report
+          path: theme-check-report.txt
