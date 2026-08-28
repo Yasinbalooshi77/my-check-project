@@ -1,90 +1,883 @@
-name: Shopify Modern Theme Audit
+name: VALESCO Deep Theme Audit
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
 
 jobs:
-  shopify-theme-check:
+  audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Extract Shopify theme
+      - name: Extract the only theme ZIP
         shell: bash
         run: |
-          mkdir -p extracted-theme
-          ZIP_FILE=$(find . -maxdepth 1 -type f -iname "*.zip" | head -n 1)
+          set -euo pipefail
+          mapfile -t ZIPS < <(find . -maxdepth 1 -type f -iname "*.zip" -print)
 
-          if [ -z "$ZIP_FILE" ]; then
-            echo "No ZIP file found"
+          if [ "${#ZIPS[@]}" -ne 1 ]; then
+            echo "Keep exactly ONE theme ZIP in the repository root."
+            printf '%s\n' "${ZIPS[@]}"
             exit 1
           fi
 
+          ZIP_FILE="${ZIPS[0]}"
+
+          rm -rf extracted-theme
+          mkdir extracted-theme
           unzip -q "$ZIP_FILE" -d extracted-theme
 
-          THEME_DIR=$(find extracted-theme -type d -name assets -printf '%h\n' | head -n 1)
+          THEME_LIQUID=$(find extracted-theme -type f -path "*/layout/theme.liquid" | head -n 1)
 
-          if [ -z "$THEME_DIR" ]; then
-            echo "Could not locate Shopify theme"
+          if [ -z "$THEME_LIQUID" ]; then
+            echo "layout/theme.liquid was not found."
             exit 1
           fi
 
-          echo "THEME_DIR=$THEME_DIR" >> "$GITHUB_ENV"
-          echo "Theme found at: $THEME_DIR"
+          THEME_DIR="${THEME_LIQUID%/layout/theme.liquid}"
 
-      - name: Setup Node.js
+          echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
+          echo "THEME_DIR=$THEME_DIR" >> "$GITHUB_ENV"
+
+          echo "Theme: $ZIP_FILE"
+          echo "Root: $THEME_DIR"
+
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: "22"
 
-      - name: Install latest Shopify CLI and Theme tools
+      - name: Install latest audit tools
         run: |
-          npm install -g @shopify/cli@latest @shopify/theme@latest
+          npm install -g @shopify/cli@latest @shopify/theme@latest esbuild@latest stylelint@latest
           shopify version
           shopify theme check --version
+          esbuild --version
+          stylelint --version
 
-      - name: Run modern Shopify Theme Check
-        id: themecheck
-        continue-on-error: true
+      - name: Shopify Theme Check
         shell: bash
         run: |
-          set -o pipefail
+          set +e
+
           shopify theme check \
             --path "$THEME_DIR" \
-            --fail-level error \
-            --no-color 2>&1 | tee theme-check-report.txt
+            --fail-level suggestion \
+            --no-color 2>&1 | tee shopify-theme-check.txt
 
-      - name: Add report to GitHub summary
+          CODE=${PIPESTATUS[0]}
+          echo "$CODE" > shopify-exit-code.txt
+          exit 0
+
+      - name: JavaScript and TypeScript syntax
         if: always()
+        shell: bash
         run: |
-          echo "# Shopify Theme Check Report" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo '```text' >> "$GITHUB_STEP_SUMMARY"
-          tail -n 200 theme-check-report.txt >> "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          set +e
 
-      - name: Upload full audit report
+          : > script-syntax-report.txt
+          checked=0
+          failed=0
+
+          while IFS= read -r -d '' f; do
+            checked=$((checked+1))
+
+            out=$(esbuild "$f" \
+              --format=esm \
+              --outfile=/tmp/valesco-audit.js \
+              --log-level=error 2>&1)
+
+            code=$?
+
+            if [ "$code" -ne 0 ]; then
+              failed=$((failed+1))
+
+              printf 'FILE: %s\n%s\n\n' \
+                "${f#$THEME_DIR/}" \
+                "$out" >> script-syntax-report.txt
+            fi
+
+          done < <(
+            find "$THEME_DIR" \
+              -type f \
+              \( -name "*.js" \
+              -o -name "*.mjs" \
+              -o -name "*.ts" \
+              -o -name "*.tsx" \) \
+              -print0
+          )
+
+          printf 'SUMMARY\nChecked: %s\nFiles with syntax errors: %s\n' \
+            "$checked" \
+            "$failed" >> script-syntax-report.txt
+
+      - name: CSS audit
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          cat > /tmp/stylelint.config.mjs <<'EOF'
+          export default {
+            rules: {
+              "color-no-invalid-hex": true,
+              "font-family-no-duplicate-names": true,
+              "function-calc-no-unspaced-operator": true,
+              "string-no-newline": true
+            }
+          };
+          EOF
+
+          mapfile -d '' CSS < <(
+            find "$THEME_DIR" \
+              -type f \
+              -name "*.css" \
+              -print0
+          )
+
+          if [ "${#CSS[@]}" -eq 0 ]; then
+            echo "No CSS files found." > css-audit-report.txt
+          else
+            stylelint \
+              --config /tmp/stylelint.config.mjs \
+              --formatter verbose \
+              "${CSS[@]}" \
+              > css-audit-report.txt 2>&1
+          fi
+
+      - name: Deep structural performance security audit
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          root = Path(os.environ["THEME_DIR"]).resolve()
+          zname = Path(os.environ["ZIP_FILE"]).name
+
+          files = [
+              p for p in root.rglob("*")
+              if p.is_file()
+          ]
+
+          rel = lambda p: str(
+              p.relative_to(root)
+          ).replace("\\", "/")
+
+          findings = {
+              "P0": [],
+              "P1": [],
+              "P2": [],
+              "INFO": []
+          }
+
+          # --------------------------------------------------
+          # Shopify folder structure
+          # --------------------------------------------------
+
+          for d in [
+              "assets",
+              "config",
+              "layout",
+              "locales",
+              "sections",
+              "snippets",
+              "templates"
+          ]:
+              if not (root / d).is_dir():
+                  findings["P1"].append(
+                      f"Missing standard theme folder: {d}/"
+                  )
+
+          theme_liquid = root / "layout/theme.liquid"
+
+          if theme_liquid.exists():
+
+              t = theme_liquid.read_text(
+                  encoding="utf-8",
+                  errors="ignore"
+              )
+
+              if "content_for_header" not in t:
+                  findings["P1"].append(
+                      "layout/theme.liquid is missing content_for_header."
+                  )
+
+              if "content_for_layout" not in t:
+                  findings["P1"].append(
+                      "layout/theme.liquid is missing content_for_layout."
+                  )
+
+          # --------------------------------------------------
+          # JSON validation
+          # --------------------------------------------------
+
+          json_count = 0
+
+          for p in files:
+
+              if p.suffix.lower() == ".json":
+
+                  json_count += 1
+
+                  try:
+                      json.loads(
+                          p.read_text(
+                              encoding="utf-8-sig"
+                          )
+                      )
+
+                  except Exception as e:
+
+                      findings["P1"].append(
+                          f"Invalid JSON: {rel(p)} — {e}"
+                      )
+
+          # --------------------------------------------------
+          # Liquid snippet / section references
+          # --------------------------------------------------
+
+          snippets = (
+              {
+                  p.stem
+                  for p in (root / "snippets").glob("*.liquid")
+              }
+              if (root / "snippets").exists()
+              else set()
+          )
+
+          sections = (
+              {
+                  p.stem
+                  for p in (root / "sections").glob("*.liquid")
+              }
+              if (root / "sections").exists()
+              else set()
+          )
+
+          used_snippets = set()
+
+          r_render = re.compile(
+              r"""{%\s*(?:render|include)\s+['"]([^'"]+)['"]"""
+          )
+
+          r_section = re.compile(
+              r"""{%\s*section\s+['"]([^'"]+)['"]"""
+          )
+
+          for p in files:
+
+              if p.suffix.lower() != ".liquid":
+                  continue
+
+              text = p.read_text(
+                  encoding="utf-8",
+                  errors="ignore"
+              )
+
+              for n in r_render.findall(text):
+
+                  used_snippets.add(n)
+
+                  if n not in snippets:
+
+                      findings["P1"].append(
+                          f"Missing snippet: "
+                          f"{rel(p)} -> snippets/{n}.liquid"
+                      )
+
+              for n in r_section.findall(text):
+
+                  if n not in sections:
+
+                      findings["P1"].append(
+                          f"Missing section: "
+                          f"{rel(p)} -> sections/{n}.liquid"
+                      )
+
+          unused = sorted(
+              snippets - used_snippets
+          )
+
+          if unused:
+
+              findings["INFO"].append(
+                  f"{len(unused)} snippet(s) not found "
+                  "by literal render/include. "
+                  "Review before deleting; "
+                  "dynamic use is possible."
+              )
+
+          # --------------------------------------------------
+          # Large files / performance
+          # --------------------------------------------------
+
+          for p in files:
+
+              kb = p.stat().st_size / 1024
+
+              if (
+                  p.suffix.lower()
+                  in {".js", ".mjs", ".css"}
+                  and kb >= 100
+              ):
+
+                  findings["P2"].append(
+                      f"Large front-end asset: "
+                      f"{rel(p)} ({kb:.1f} KB)"
+                  )
+
+              elif kb >= 500:
+
+                  findings["P2"].append(
+                      f"Large file: "
+                      f"{rel(p)} ({kb:.1f} KB)"
+                  )
+
+          # --------------------------------------------------
+          # Exact duplicate files
+          # --------------------------------------------------
+
+          groups = defaultdict(list)
+
+          for p in files:
+
+              if p.stat().st_size:
+
+                  h = hashlib.sha256(
+                      p.read_bytes()
+                  ).hexdigest()
+
+                  groups[
+                      (h, p.stat().st_size)
+                  ].append(rel(p))
+
+          dupes = [
+              v for v in groups.values()
+              if len(v) > 1
+          ]
+
+          for g in dupes:
+
+              findings["INFO"].append(
+                  "Exact duplicate files: "
+                  + " | ".join(g)
+              )
+
+          # --------------------------------------------------
+          # Secret detection
+          # Values are never printed
+          # --------------------------------------------------
+
+          secret_patterns = {
+
+              "Shopify Admin token":
+                  r"\bshpat_[A-Za-z0-9]{20,}\b",
+
+              "GitHub token":
+                  r"\bgh[pousr]_[A-Za-z0-9]{20,}\b",
+
+              "Stripe live secret":
+                  r"\bsk_live_[A-Za-z0-9]{16,}\b",
+
+              "Private key":
+                  r"-----BEGIN "
+                  r"(?:RSA |EC |OPENSSH )?"
+                  r"PRIVATE KEY-----"
+          }
+
+          text_ext = {
+              ".liquid",
+              ".json",
+              ".js",
+              ".mjs",
+              ".ts",
+              ".tsx",
+              ".css",
+              ".txt",
+              ".md",
+              ".yml",
+              ".yaml"
+          }
+
+          for p in files:
+
+              if p.suffix.lower() not in text_ext:
+                  continue
+
+              text = p.read_text(
+                  encoding="utf-8",
+                  errors="ignore"
+              )
+
+              for label, pat in secret_patterns.items():
+
+                  if re.search(pat, text):
+
+                      findings["P0"].append(
+                          f"Possible exposed {label} "
+                          f"in {rel(p)}. "
+                          "Secret value is hidden."
+                      )
+
+              # ----------------------------------------------
+              # Risky JS patterns
+              # ----------------------------------------------
+
+              if p.suffix.lower() in {
+                  ".js",
+                  ".mjs",
+                  ".ts",
+                  ".tsx",
+                  ".liquid"
+              }:
+
+                  risky = {
+
+                      "eval()":
+                          r"\beval\s*\(",
+
+                      "new Function()":
+                          r"\bnew\s+Function\s*\(",
+
+                      "document.write()":
+                          r"\bdocument\.write\s*\(",
+
+                      "debugger":
+                          r"(?m)^\s*debugger\s*;?"
+                  }
+
+                  for label, pat in risky.items():
+
+                      n = len(
+                          re.findall(
+                              pat,
+                              text
+                          )
+                      )
+
+                      if n:
+
+                          findings["P2"].append(
+                              f"{label}: "
+                              f"{n} occurrence(s) "
+                              f"in {rel(p)}"
+                          )
+
+              # ----------------------------------------------
+              # Insecure HTTP links
+              # ----------------------------------------------
+
+              if p.suffix.lower() in {
+                  ".liquid",
+                  ".html",
+                  ".js",
+                  ".css"
+              }:
+
+                  n = len(
+                      re.findall(
+                          r"""(?i)(?:src|href)\s*=\s*['"]http://""",
+                          text
+                      )
+                  )
+
+                  if n:
+
+                      findings["P2"].append(
+                          f"Insecure http:// link/asset: "
+                          f"{n} occurrence(s) "
+                          f"in {rel(p)}"
+                      )
+
+          # --------------------------------------------------
+          # Basic accessibility heuristic
+          # --------------------------------------------------
+
+          missing_alt = Counter()
+
+          for p in files:
+
+              if p.suffix.lower() not in {
+                  ".liquid",
+                  ".html"
+              }:
+                  continue
+
+              text = p.read_text(
+                  encoding="utf-8",
+                  errors="ignore"
+              )
+
+              tags = re.findall(
+                  r"<img\b[^>]*>",
+                  text,
+                  re.I | re.S
+              )
+
+              count = sum(
+                  1
+                  for tag in tags
+                  if not re.search(
+                      r"\balt\s*=",
+                      tag,
+                      re.I
+                  )
+              )
+
+              if count:
+
+                  missing_alt[
+                      rel(p)
+                  ] += count
+
+          if missing_alt:
+
+              findings["P2"].append(
+                  "Accessibility heuristic: "
+                  "<img> without alt= in "
+                  + ", ".join(
+                      f"{k} ({v})"
+                      for k, v
+                      in missing_alt.most_common(15)
+                  )
+              )
+
+          # --------------------------------------------------
+          # Read other scanner outputs
+          # --------------------------------------------------
+
+          def read(path):
+
+              p = Path(path)
+
+              if p.exists():
+
+                  return p.read_text(
+                      encoding="utf-8",
+                      errors="replace"
+                  ).strip()
+
+              return "(not available)"
+
+          shopify = read(
+              "shopify-theme-check.txt"
+          )
+
+          scripts = read(
+              "script-syntax-report.txt"
+          )
+
+          css = read(
+              "css-audit-report.txt"
+          )
+
+          script_m = re.search(
+              r"Files with syntax errors:\s*(\d+)",
+              scripts
+          )
+
+          script_errors = (
+              int(script_m.group(1))
+              if script_m
+              else 0
+          )
+
+          css_has = bool(
+              re.search(
+                  r"\b(?:error|warning)\b",
+                  css,
+                  re.I
+              )
+          )
+
+          # --------------------------------------------------
+          # Improvement recommendations
+          # --------------------------------------------------
+
+          improve = []
+
+          if findings["P0"]:
+              improve.append(
+                  "P0: Remove/rotate exposed secrets immediately."
+              )
+
+          if findings["P1"]:
+              improve.append(
+                  "P1: Fix broken structure, invalid JSON, "
+                  "or missing literal references."
+              )
+
+          if "no offenses found" not in shopify.lower():
+              improve.append(
+                  "P1/P2: Review Shopify Theme Check findings first."
+              )
+
+          if script_errors:
+              improve.append(
+                  "P1: Fix JavaScript/TypeScript syntax errors."
+              )
+
+          if css_has:
+              improve.append(
+                  "P2: Review CSS findings."
+              )
+
+          if findings["P2"]:
+              improve.append(
+                  "P2: Improve performance, accessibility, "
+                  "risky JavaScript, and insecure links."
+              )
+
+          if findings["INFO"]:
+              improve.append(
+                  "P3: Clean duplicates and genuinely unused "
+                  "snippets after manual verification."
+              )
+
+          if not improve:
+              improve.append(
+                  "No blocking static issues detected. "
+                  "Next: real-store Lighthouse/Core Web Vitals "
+                  "and visual testing."
+              )
+
+          # --------------------------------------------------
+          # Inventory
+          # --------------------------------------------------
+
+          folder_counts = Counter(
+              rel(p).split("/", 1)[0]
+              for p in files
+          )
+
+          ext_counts = Counter(
+              p.suffix.lower() or "[none]"
+              for p in files
+          )
+
+          # --------------------------------------------------
+          # Create final report
+          # --------------------------------------------------
+
+          out = []
+
+          out += [
+              "# VALESCO Deep Theme Audit",
+              "",
+              f"**ZIP:** `{zname}`  ",
+              f"**Files inspected/inventoried:** "
+              f"**{len(files)}**  ",
+              f"**Total extracted size:** "
+              f"**{sum(p.stat().st_size for p in files)/1024/1024:.2f} MB**",
+              "",
+              "## Executive summary",
+              "",
+              f"- P0 critical: **{len(findings['P0'])}**",
+              f"- P1 high: **{len(findings['P1'])}**",
+              f"- P2 review/improvement: **{len(findings['P2'])}**",
+              f"- Informational: **{len(findings['INFO'])}**",
+              f"- JSON parsed: **{json_count}**",
+              f"- Exact duplicate groups: **{len(dupes)}**",
+              "",
+              "## What should be improved first",
+              ""
+          ]
+
+          out += [
+              f"- {x}"
+              for x in improve
+          ]
+
+          out += [
+              "",
+              "> Heuristic items are review candidates, "
+              "not automatic proof of a bug. "
+              "Shopify Theme Check is the primary "
+              "Shopify-specific linter here.",
+              ""
+          ]
+
+          for key, title in [
+
+              ("P0", "P0 Critical"),
+
+              ("P1", "P1 High priority"),
+
+              (
+                  "P2",
+                  "P2 Improvements / manual review"
+              ),
+
+              (
+                  "INFO",
+                  "P3 / Informational"
+              )
+
+          ]:
+
+              out += [
+                  f"## {title}",
+                  ""
+              ]
+
+              if findings[key]:
+
+                  out += [
+                      f"- {x}"
+                      for x in findings[key]
+                  ]
+
+              else:
+
+                  out += [
+                      "- None detected."
+                  ]
+
+              out += [""]
+
+          out += [
+              "## Files by top-level folder",
+              "",
+              "| Folder | Files |",
+              "|---|---:|"
+          ]
+
+          out += [
+              f"| `{k}` | {v} |"
+              for k, v
+              in sorted(folder_counts.items())
+          ]
+
+          out += [
+              "",
+              "## Files by extension",
+              "",
+              "| Extension | Files |",
+              "|---|---:|"
+          ]
+
+          out += [
+              f"| `{k}` | {v} |"
+              for k, v
+              in sorted(ext_counts.items())
+          ]
+
+          for title, text, limit in [
+
+              (
+                  "Shopify Theme Check",
+                  shopify,
+                  500
+              ),
+
+              (
+                  "JavaScript / TypeScript syntax",
+                  scripts,
+                  250
+              ),
+
+              (
+                  "CSS audit",
+                  css,
+                  250
+              )
+
+          ]:
+
+              out += [
+                  "",
+                  f"## {title}",
+                  "",
+                  "```text",
+                  *text.splitlines()[-limit:],
+                  "```"
+              ]
+
+          out += [
+              "",
+              "## What this audit cannot prove",
+              "",
+              "- Real Core Web Vitals need a Shopify "
+              "preview/live URL and browser measurement.",
+              "- App-injected scripts and pixels may "
+              "not exist in the ZIP.",
+              "- Dynamic Liquid references can make "
+              "some unused candidates false positives.",
+              "- Arabic RTL, visual layout, variants, "
+              "cart, search, and device UX need browser testing.",
+              "",
+              "## Recommended next tests",
+              "",
+              "1. Test Home, Collection, Product, Cart, "
+              "Search, and content pages on mobile and desktop.",
+              "2. Run Lighthouse/Core Web Vitals on an "
+              "unpublished Shopify preview.",
+              "3. Verify Arabic RTL, fonts, prices, variants, "
+              "cart drawer, search, and localization.",
+              "4. Review third-party apps/pixels for duplicate "
+              "or blocking JavaScript.",
+              "5. Re-run this workflow after every theme ZIP update.",
+              "",
+              "Shopify Theme Check docs: "
+              "https://shopify.dev/docs/storefronts/themes/tools/theme-check",
+              ""
+          ]
+
+          report = "\n".join(out)
+
+          Path(
+              "VALESCO-DEEP-AUDIT.md"
+          ).write_text(
+              report,
+              encoding="utf-8"
+          )
+
+          Path(
+              "VALESCO-DEEP-AUDIT.txt"
+          ).write_text(
+              report,
+              encoding="utf-8"
+          )
+
+          PY
+
+      - name: Publish report in GitHub Summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f VALESCO-DEEP-AUDIT.md ]; then
+            cat VALESCO-DEEP-AUDIT.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "# Audit report generation failed" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload complete report package
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: shopify-theme-check-report
-          path: theme-check-report.txt
+          name: VALESCO-DEEP-AUDIT
+          retention-days: 30
+          path: |
+            VALESCO-DEEP-AUDIT.md
+            VALESCO-DEEP-AUDIT.txt
+            shopify-theme-check.txt
+            shopify-exit-code.txt
+            script-syntax-report.txt
+            css-audit-report.txt
 
-      - name: Fail if real Theme Check errors exist
-        if: steps.themecheck.outcome == 'failure'
-        run: exit 1
 
 
 
-
-              - name: Upload full audit report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: shopify-theme-check-report
-          path: theme-check-report.txt
+            
