@@ -1,37 +1,80 @@
-name: GitHub AI Full Auto-Fix
+name: Shopify Modern Theme Audit
 
-on: [push]
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
-  shopify-ai-fix:
+  shopify-theme-check:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
 
     steps:
-    - name: Checkout Repository Files
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Extract Shopify Theme Files
-      run: unzip *.zip -d my_extracted_files
+      - name: Extract Shopify theme
+        shell: bash
+        run: |
+          mkdir -p extracted-theme
+          ZIP_FILE=$(find . -maxdepth 1 -type f -iname "*.zip" | head -n 1)
 
-    # 1. تشغيل أداة شوبيفاي لإصلاح وسوم Liquid تلقائياً لزيادة السرعة
-    - name: Run Shopify AI Auto-Fix
-      run: |
-        sudo gem install theme-check
-        cd my_extracted_files
-        theme-check --auto-correct . || true
+          if [ -z "$ZIP_FILE" ]; then
+            echo "No ZIP file found"
+            exit 1
+          fi
 
-    # 2. إعادة ضغط الملفات بعد تسريعها وحفظها بأمان
-    - name: Zip Optimized Theme
-      run: |
-        cd my_extracted_files
-        zip -r ../VALESCO-V8-OPTIMIZED.zip .
+          unzip -q "$ZIP_FILE" -d extracted-theme
 
-    # 3. رفع ملف القالب السريع والجديد بداخل حسابك مجاناً
-    - name: Upload Speedy Theme File
-      uses: actions/upload-artifact@v4
-      with:
-        name: Shopify-Speedy-Theme
-        path: VALESCO-V8-OPTIMIZED.zip
+          THEME_DIR=$(find extracted-theme -type d -name assets -printf '%h\n' | head -n 1)
+
+          if [ -z "$THEME_DIR" ]; then
+            echo "Could not locate Shopify theme"
+            exit 1
+          fi
+
+          echo "THEME_DIR=$THEME_DIR" >> "$GITHUB_ENV"
+          echo "Theme found at: $THEME_DIR"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install latest Shopify CLI and Theme tools
+        run: |
+          npm install -g @shopify/cli@latest @shopify/theme@latest
+          shopify version
+          shopify theme check --version
+
+      - name: Run modern Shopify Theme Check
+        id: themecheck
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          shopify theme check \
+            --path "$THEME_DIR" \
+            --fail-level error \
+            --no-color 2>&1 | tee theme-check-report.txt
+
+      - name: Add report to GitHub summary
+        if: always()
+        run: |
+          echo "# Shopify Theme Check Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          tail -n 200 theme-check-report.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shopify-theme-check-report
+          path: theme-check-report.txt
+
+      - name: Fail if real Theme Check errors exist
+        if: steps.themecheck.outcome == 'failure'
+        run: exit 1
